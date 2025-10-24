@@ -2,6 +2,8 @@ package logger
 
 import "log"
 
+var Debug bool = true
+
 const (
 	green = "\033[1;32m"
 	cyan  = "\033[1;36m"
@@ -11,17 +13,25 @@ const (
 )
 
 func Log_cli(str string) {
-	log.Println("Client: " + green + str + reset)
+	if Debug {
+		log.Println(str)
+	}
 }
 
 func Log_fatal(str string) {
-	log.Println(red + str + reset)
+	if Debug {
+		log.Println(red + str + reset)
+	}
 }
 
 func Log(str string) {
-	log.Println(cyan + str + reset)
+	if Debug {
+		log.Println(cyan + str + reset)
+	}
 }
 
 func Log_import(str string) {
-	log.Println(gold + str + reset)
+	if Debug {
+		log.Println(gold + str + reset)
+	}
 }

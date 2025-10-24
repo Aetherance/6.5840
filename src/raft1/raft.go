@@ -7,6 +7,7 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -14,8 +15,17 @@ import (
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
+	m_logger "6.5840/raft1/log"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
+)
+
+type State int
+
+const (
+	follower = iota
+	leader
+	candidate
 )
 
 // 实现单个 Raft 对等节点的 Go 对象。
@@ -25,12 +35,12 @@ type Raft struct {
 	persister *tester.Persister   // 用于保存此对等节点持久化状态的对象
 	me        int                 // 此对等节点在 peers[] 中的索引
 	dead      int32               // 由 Kill() 设置
-	isLeader  bool
+	state     State
 
 	// All
 	currentTerm int
-	voteFor 	int
-	logs 		[]LogEntry
+	voteFor     int
+	logs        []LogEntry
 
 	// All changable
 	commitIndex int
@@ -40,21 +50,26 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
+	lastHeartBeat time.Time
+	recvVotes int
+
 	// 你的数据在这里 (3A, 3B, 3C)。
 	// 查看论文中的图 2 了解 Raft 服务器必须维护的状态描述。
 }
 
 type LogEntry struct {
 	Command interface{}
-	Term int
+	Term    int
 }
 
 // 返回 currentTerm 以及此服务器是否认为自己是领导者。
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	term = rf.currentTerm
-	isleader = rf.isLeader
+	isleader = rf.state == leader
 	return term, isleader
 }
 
@@ -108,21 +123,93 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 你的代码在这里 (3D)。
 }
 
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	reply.Success = false
+	
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+        rf.state = follower
+        rf.voteFor = -1
+		reply.Success = true
+    }
+	rf.lastHeartBeat = time.Now()
+	
+	if rf.state == candidate {
+		rf.state = follower
+	}
+	
+	reply.Success = true
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	}
+	rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	m_logger.Log(fmt.Sprintf("Server %d recv AppendEntries from %d",rf.me,args.LeaderId))
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 // 示例 RequestVote RPC 参数结构。
 // 字段名必须以大写字母开头！
 type RequestVoteArgs struct {
-	// 你的数据在这里 (3A, 3B)。
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // 示例 RequestVote RPC 回复结构。
 // 字段名必须以大写字母开头！
 type RequestVoteReply struct {
-	// 你的数据在这里 (3A)。
+	Term        int
+	VoteGranted bool
 }
 
 // 示例 RequestVote RPC 处理程序。
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// 你的代码在这里 (3A, 3B)。
+	// 你的代码在这里 (3A, 3B)
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	
+	// 同步被要票节点任期
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = follower
+		rf.voteFor = -1
+		rf.lastHeartBeat = time.Now()
+	}
+
+	// 开始要票
+	if args.Term < rf.currentTerm || rf.voteFor != -1 {
+		// 没要到
+		reply.VoteGranted = false
+	} else {
+		// 要到了
+		m_logger.Log_cli(fmt.Sprintf("Candidate %d request server %d 's votation successfully!",args.CandidateId,rf.me))
+		reply.VoteGranted = true
+		rf.voteFor = args.CandidateId
+		rf.lastHeartBeat = time.Now()
+	}
+
+	rf.mu.Unlock()
 }
 
 // 发送 RequestVote RPC 到服务器的示例代码。
@@ -141,6 +228,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 // 如果遇到 RPC 工作问题，请检查是否已将通过 RPC 传递的结构中的所有字段名大写，
 // 并且调用方使用 & 传递回复结构的地址，而不是结构本身。
+
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -157,7 +245,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := rf.state == leader
 
 	// 你的代码在这里 (3B)。
 
@@ -186,10 +274,20 @@ func (rf *Raft) ticker() {
 
 		// 你的代码在这里 (3A)
 		// 检查是否应开始领导者选举。
-
-		// 暂停随机时间，介于 50 到 350 毫秒之间。
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		rf.mu.Lock()
+		sinceLastHeartBeat := time.Since(rf.lastHeartBeat).Milliseconds()
+		timeout := 150 + (rand.Int63() % 70)
+		if rf.state != leader && sinceLastHeartBeat > timeout {
+			m_logger.Log_import(fmt.Sprintf("Server %d timeout!",rf.me))
+			rf.mu.Unlock()
+			rf.startElection()
+		} else {
+			rf.mu.Unlock()
+		}
+		if rf.killed() {
+			m_logger.Log_fatal(fmt.Sprintf("The server %d is died ~",rf.me))
+		}
+		time.Sleep(time.Duration(10) * time.Millisecond)
 	}
 }
 
@@ -198,13 +296,17 @@ func (rf *Raft) ticker() {
 // 此服务器的端口是 peers[me]。所有服务器的 peers[] 数组顺序相同。
 // persister 是此服务器保存其持久状态的地方，并且最初保存最近保存的状态（如果有）。
 // applyCh 是一个通道，测试程序或服务期望 Raft 通过它发送 ApplyMsg 消息。
-// Make() 必须快速返回，因此它应为任何长时间运行的工作启动 goroutine。
+// Make() 必须快速返回，因此它应为gmi任何长时间运行的工作启动 goroutine。
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.voteFor = -1
+	rf.state = follower
+	rf.recvVotes = 0
+	m_logger.Log_import(fmt.Sprintf("Server %d was made!",me))
 
 	// 你的初始化代码在这里 (3A, 3B, 3C)。
 
@@ -215,4 +317,80 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	rf.state = candidate
+	rf.currentTerm++
+	rf.recvVotes = 1
+	rf.voteFor = rf.me
+
+	log := fmt.Sprintf("Server %d start Election! term is %d", rf.me, rf.currentTerm)
+	m_logger.Log(log)
+	
+	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
+	reply := RequestVoteReply{}
+
+	for peerIndex := range rf.peers {
+		if peerIndex == rf.me {
+			continue
+		}
+		rf.mu.Unlock()
+		rf.sendRequestVote(peerIndex, &args, &reply)
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.state = follower
+			rf.voteFor = -1
+			rf.currentTerm = reply.Term
+		}
+		if reply.VoteGranted {
+			rf.recvVotes++
+		}
+	}
+	log = fmt.Sprintf("Server %d recvVote : %d, all : %d", rf.me, rf.recvVotes, len(rf.peers))
+	m_logger.Log(log)
+	if rf.recvVotes > len(rf.peers)/2 && rf.state == candidate {
+		rf.state = leader
+		m_logger.Log_import(fmt.Sprintf("\nElection finished! Term %d 's Leader is %d",rf.currentTerm,rf.me))
+		rf.mu.Unlock()
+		rf.leaderIssuesOrders()
+	} else {
+		rf.state = follower
+		rf.voteFor = -1
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) leaderIssuesOrders() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		if rf.state != leader {
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+		
+		for peerIndex := range rf.peers {
+			if peerIndex == rf.me {
+				continue
+			}
+			rf.mu.Lock()
+			term := rf.currentTerm
+			reply := AppendEntriesReply{}
+			rf.mu.Unlock()
+			rf.sendAppendEntries(peerIndex, &AppendEntriesArgs{Term: term, LeaderId: rf.me}, &reply)
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.state = follower
+				rf.voteFor = -1
+				rf.currentTerm = reply.Term
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+		}
+		
+		time.Sleep(time.Duration(10) * time.Millisecond)
+	}
 }
